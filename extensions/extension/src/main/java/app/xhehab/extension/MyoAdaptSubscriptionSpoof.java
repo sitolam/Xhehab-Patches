@@ -2,6 +2,9 @@ package app.xhehab.extension;
 
 import android.content.Context;
 import android.util.Log;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
@@ -10,6 +13,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.Locale;
 import okhttp3.Interceptor;
+import okhttp3.Request;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
 import org.json.JSONArray;
@@ -51,6 +55,19 @@ public final class MyoAdaptSubscriptionSpoof {
 
     private static volatile boolean installed = false;
 
+    // ---- Diagnostic / forge (temporary R&D build) -----------------------------
+    // The session-start action is gated server-side (HTTP 402). To learn the exact
+    // success shape and prototype the rewrite without re-patching each attempt, this
+    // build logs all /api/action/ traffic and applies "forge" rules read from the
+    // app's own external files dir:
+    //   <externalFilesDir>/forge/rules      lines: <urlSubstring>|<bodyFileName>
+    //   <externalFilesDir>/forge/<bodyFile> canned 200 body returned for matches
+    // Files are pushed with plain `adb push` (app-owned dir, no root). Absent/empty
+    // config = plain pass-through, so shipping this build changes nothing until a
+    // rule is pushed.
+    private static volatile Context appContext = null;
+    private static final String ACTION_MARKER = "/api/action/";
+
     private MyoAdaptSubscriptionSpoof() {}
 
     /**
@@ -63,6 +80,9 @@ public final class MyoAdaptSubscriptionSpoof {
      * only logs the user out.
      */
     public static void install(Context context) {
+        if (context != null) {
+            appContext = context.getApplicationContext();
+        }
         try {
             installOkHttpFactory();
         } catch (Throwable t) {
@@ -164,9 +184,32 @@ public final class MyoAdaptSubscriptionSpoof {
         return new Interceptor() {
             @Override
             public Response intercept(Chain chain) throws java.io.IOException {
-                Response response = chain.proceed(chain.request());
+                final Request request = chain.request();
+                final String url = String.valueOf(request.url());
+                Response response = chain.proceed(request);
 
-                final String url = String.valueOf(chain.request().url());
+                final boolean action = url.contains(ACTION_MARKER);
+
+                // Forge: turn a gated/failed action into a canned 200 success.
+                // Runs before the isSuccessful() gate below because the whole point
+                // is to rewrite the 402.
+                if (action) {
+                    try {
+                        Response forged = maybeForge(response, url);
+                        if (forged != null) {
+                            return forged;
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "forge failed url=" + url + " err=" + t.getMessage());
+                    }
+                    // Diagnostic capture of the real request/response.
+                    try {
+                        logAction(request, response, url);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "diag failed url=" + url + " err=" + t.getMessage());
+                    }
+                }
+
                 final int kind = payloadKind(url);
                 if (kind == KIND_NONE || !response.isSuccessful()) {
                     return response;
@@ -206,6 +249,134 @@ public final class MyoAdaptSubscriptionSpoof {
                         .build();
             }
         };
+    }
+
+    // ---- Diagnostic / forge helpers -------------------------------------------
+
+    private static File forgeDir() {
+        Context ctx = appContext;
+        if (ctx == null) return null;
+        File ext = ctx.getExternalFilesDir(null);
+        if (ext == null) return null;
+        return new File(ext, "forge");
+    }
+
+    /**
+     * If a forge rule matches this url, return a synthetic 200 response carrying the
+     * canned body from the rule's file. Returns null when no rule matches (or the
+     * config is absent), leaving the real response untouched.
+     */
+    private static Response maybeForge(Response response, String url) {
+        File dir = forgeDir();
+        if (dir == null) return null;
+        File rules = new File(dir, "rules");
+        if (!rules.isFile()) return null;
+
+        String rulesText = readTextFile(rules);
+        if (rulesText == null) return null;
+
+        for (String line : rulesText.split("\n")) {
+            line = line.trim();
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            int bar = line.indexOf('|');
+            if (bar <= 0) continue;
+            String urlSubstring = line.substring(0, bar).trim();
+            String bodyFile = line.substring(bar + 1).trim();
+            if (urlSubstring.isEmpty() || bodyFile.isEmpty()) continue;
+            if (!url.contains(urlSubstring)) continue;
+
+            String body = readTextFile(new File(dir, bodyFile));
+            if (body == null || body.isEmpty()) {
+                // Rule staged but body not ready — leave the real response alone.
+                return null;
+            }
+            Log.i(TAG, "FORGE match rule='" + urlSubstring + "' file=" + bodyFile
+                    + " origCode=" + response.code() + " url=" + url);
+            ResponseBody rb = response.body();
+            okhttp3.MediaType type =
+                    rb != null && rb.contentType() != null
+                            ? rb.contentType()
+                            : okhttp3.MediaType.parse("application/json; charset=utf-8");
+            return response.newBuilder()
+                    .code(200)
+                    .message("OK")
+                    .removeHeader("Content-Encoding")
+                    .removeHeader("Content-Length")
+                    .body(ResponseBody.create(body, type))
+                    .build();
+        }
+        return null;
+    }
+
+    /** Log the full request + response of an action call, chunked past logcat's limit. */
+    private static void logAction(Request request, Response response, String url) {
+        String method = request.method();
+        String reqBody = readRequestBody(request);
+        String respBody = null;
+        try {
+            respBody = response.peekBody(PEEK_LIMIT).string();
+        } catch (Throwable ignored) {
+        }
+        String tail = url.contains(ACTION_MARKER)
+                ? url.substring(url.indexOf(ACTION_MARKER) + ACTION_MARKER.length())
+                : url;
+        Log.i(TAG, "ACTION " + method + " code=" + response.code() + " " + tail);
+        logChunked("REQ[" + tail + "]", reqBody);
+        logChunked("RESP[" + tail + "](" + response.code() + ")", respBody);
+    }
+
+    private static void logChunked(String label, String text) {
+        if (text == null) {
+            Log.i(TAG, label + " <null>");
+            return;
+        }
+        final int chunk = 3000;
+        int total = (text.length() + chunk - 1) / chunk;
+        if (total == 0) {
+            Log.i(TAG, label + " <empty>");
+            return;
+        }
+        for (int i = 0; i < total; i++) {
+            int start = i * chunk;
+            int end = Math.min(start + chunk, text.length());
+            Log.i(TAG, label + " " + (i + 1) + "/" + total + " " + text.substring(start, end));
+        }
+    }
+
+    /**
+     * Read a (repeatable) request body without a compile-time okio dependency.
+     * Fable-remoting bodies are small JSON strings, so this is cheap and safe.
+     */
+    private static String readRequestBody(Request request) {
+        try {
+            Object rb = request.body();
+            if (rb == null) return null;
+            Class<?> bufferCls = Class.forName("okio.Buffer");
+            Class<?> sinkCls = Class.forName("okio.BufferedSink");
+            Object buffer = bufferCls.getConstructor().newInstance();
+            Method writeTo = rb.getClass().getMethod("writeTo", sinkCls);
+            writeTo.invoke(rb, buffer);
+            Method readUtf8 = bufferCls.getMethod("readUtf8");
+            return (String) readUtf8.invoke(buffer);
+        } catch (Throwable t) {
+            return "<unreadable: " + t.getClass().getSimpleName() + ">";
+        }
+    }
+
+    private static String readTextFile(File f) {
+        if (f == null || !f.isFile()) return null;
+        try (FileInputStream in = new FileInputStream(f)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) {
+                out.write(buf, 0, n);
+            }
+            return out.toString("UTF-8");
+        } catch (Throwable t) {
+            Log.w(TAG, "readTextFile failed " + f + ": " + t.getMessage());
+            return null;
+        }
     }
 
     /** RevenueCat /subscribers response — schema is known, spoof it wholesale. */
