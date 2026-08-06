@@ -10,8 +10,11 @@ import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import okhttp3.Interceptor;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -67,6 +70,21 @@ public final class MyoAdaptSubscriptionSpoof {
     // rule is pushed.
     private static volatile Context appContext = null;
     private static final String ACTION_MARKER = "/api/action/";
+
+    // Replay forge: some actions are gated server-side (HTTP 402) even though a
+    // sibling query returns the exact same type for free. StartPrePlannedSession
+    // returns PrePlannedSessionResponse { session } — identical to what
+    // GetPrePlannedSession (a free query) already returned moments earlier when the
+    // preview screen loaded. So we cache each successful action body and, when a
+    // gated action fails, replay its sibling's body as a synthetic 200.
+    //
+    // Rules default to the known mapping and can be overridden without re-patching
+    // via <externalFilesDir>/forge/replay, lines: <gatedAction>|<sourceAction>|<wrap>
+    //   wrap = ok   -> ["Ok", <body>]   (Result-returning action)
+    //          some -> ["Some", <body>] (option-returning action)
+    //          raw  -> <body>           (record returned directly)
+    private static final Map<String, String> LAST_BODY = new ConcurrentHashMap<>();
+    private static final long REPLAY_CACHE_LIMIT = 8L * 1024L * 1024L;
 
     private MyoAdaptSubscriptionSpoof() {}
 
@@ -190,10 +208,31 @@ public final class MyoAdaptSubscriptionSpoof {
 
                 final boolean action = url.contains(ACTION_MARKER);
 
-                // Forge: turn a gated/failed action into a canned 200 success.
-                // Runs before the isSuccessful() gate below because the whole point
-                // is to rewrite the 402.
                 if (action) {
+                    final String shortName = shortAction(url);
+
+                    if (response.isSuccessful()) {
+                        // Cache the body so a gated sibling can replay it.
+                        try {
+                            String cached = response.peekBody(REPLAY_CACHE_LIMIT).string();
+                            if (cached != null && !cached.isEmpty()) {
+                                LAST_BODY.put(shortName, cached);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    } else {
+                        // Gated action failed — replay a cached sibling as a 200.
+                        try {
+                            Response replayed = maybeReplay(response, shortName);
+                            if (replayed != null) {
+                                return replayed;
+                            }
+                        } catch (Throwable t) {
+                            Log.w(TAG, "replay failed url=" + url + " err=" + t.getMessage());
+                        }
+                    }
+
+                    // Static-file forge (canned body per url substring).
                     try {
                         Response forged = maybeForge(response, url);
                         if (forged != null) {
@@ -249,6 +288,82 @@ public final class MyoAdaptSubscriptionSpoof {
                         .build();
             }
         };
+    }
+
+    // ---- Replay forge ---------------------------------------------------------
+
+    /** Last path segment of an action url, e.g. ".../TrainingActions/StartX" -> "StartX". */
+    private static String shortAction(String url) {
+        String u = url;
+        int q = u.indexOf('?');
+        if (q >= 0) u = u.substring(0, q);
+        int slash = u.lastIndexOf('/');
+        return slash >= 0 ? u.substring(slash + 1) : u;
+    }
+
+    /** gatedAction -> [sourceAction, wrap]. */
+    private static Map<String, String[]> replayRules() {
+        Map<String, String[]> rules = new HashMap<>();
+        // Default: the known session-start mapping.
+        rules.put("StartPrePlannedSession", new String[] {"GetPrePlannedSession", "ok"});
+
+        File dir = forgeDir();
+        if (dir != null) {
+            String cfg = readTextFile(new File(dir, "replay"));
+            if (cfg != null) {
+                // A present config file fully replaces the defaults.
+                rules.clear();
+                for (String line : cfg.split("\n")) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    String[] p = line.split("\\|");
+                    if (p.length >= 2) {
+                        String gated = p[0].trim();
+                        String source = p[1].trim();
+                        String wrap = p.length >= 3 ? p[2].trim() : "ok";
+                        if (!gated.isEmpty() && !source.isEmpty()) {
+                            rules.put(gated, new String[] {source, wrap});
+                        }
+                    }
+                }
+            }
+        }
+        return rules;
+    }
+
+    /** If a gated action has a cached sibling body, return it as a synthetic 200. */
+    private static Response maybeReplay(Response response, String shortName) {
+        String[] rule = replayRules().get(shortName);
+        if (rule == null) return null;
+        String cached = LAST_BODY.get(rule[0]);
+        if (cached == null || cached.isEmpty()) {
+            Log.i(TAG, "REPLAY skip " + shortName + " <- " + rule[0]
+                    + " (no cached source body yet) code=" + response.code());
+            return null;
+        }
+        String wrap = rule[1];
+        String body;
+        if ("some".equals(wrap)) {
+            body = "[\"Some\"," + cached + "]";
+        } else if ("raw".equals(wrap)) {
+            body = cached;
+        } else {
+            body = "[\"Ok\"," + cached + "]";
+        }
+        Log.i(TAG, "REPLAY " + shortName + " <- " + rule[0] + " wrap=" + wrap
+                + " origCode=" + response.code() + " len=" + body.length());
+        ResponseBody rb = response.body();
+        okhttp3.MediaType type =
+                rb != null && rb.contentType() != null
+                        ? rb.contentType()
+                        : okhttp3.MediaType.parse("application/json; charset=utf-8");
+        return response.newBuilder()
+                .code(200)
+                .message("OK")
+                .removeHeader("Content-Encoding")
+                .removeHeader("Content-Length")
+                .body(ResponseBody.create(body, type))
+                .build();
     }
 
     // ---- Diagnostic / forge helpers -------------------------------------------
