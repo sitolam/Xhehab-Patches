@@ -1,3 +1,9 @@
+## [3.3.3](https://github.com/sitolam/Xhehab-Patches/compare/v3.3.2...v3.3.3) (2026-08-06)
+
+### 🐛 Bug Fixes
+
+* MyoAdapt start session by replaying planned-session response ([4b6b702](https://github.com/sitolam/Xhehab-Patches/commit/4b6b7028821ebc70db45f11a6b07392ea1672f27))
+
 ## [3.3.2](https://github.com/sitolam/Xhehab-Patches/compare/v3.3.1...v3.3.2) (2026-08-06)
 
 ### 🐛 Bug Fixes
