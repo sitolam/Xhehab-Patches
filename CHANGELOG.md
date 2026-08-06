@@ -1,3 +1,9 @@
+## [3.3.2](https://github.com/sitolam/Xhehab-Patches/compare/v3.3.1...v3.3.2) (2026-08-06)
+
+### 🐛 Bug Fixes
+
+* MyoAdapt session-start diagnostics and forge hook ([b7d3b03](https://github.com/sitolam/Xhehab-Patches/commit/b7d3b03c32027e170b0379e35827c71a5a0e7d5f))
+
 ## [3.3.1](https://github.com/sitolam/Xhehab-Patches/compare/v3.3.0...v3.3.1) (2026-08-06)
 
 ### 🐛 Bug Fixes
