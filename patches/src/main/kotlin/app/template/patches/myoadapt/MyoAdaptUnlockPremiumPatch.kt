@@ -22,7 +22,13 @@ import com.android.tools.smali.dexlib2.AccessFlags
  * 1) Hybrid CustomerInfo map spoof
  * 2) Native EntitlementInfos + isActive
  * 3) CustomerInfoFactory JSON spoof (confirmed working)
- * 4) MainApplication.onCreate → install OkHttp factory interceptor + clear MMKV
+ * 4) MainApplication.onCreate → install OkHttp factory interceptor
+ *
+ * The interceptor only rewrites subscription-scoped values on the session
+ * endpoints. It must not touch anything else: those responses also carry the
+ * user's programs and workouts, and the Fable decoders reject payloads that
+ * have been reshaped. Local storage is never cleared — the session token lives
+ * there too.
  */
 private const val PRIMARY_ENTITLEMENT = "core-access"
 private const val PRIMARY_PRODUCT = "main_sub"
@@ -120,7 +126,7 @@ val myoAdaptUnlockPremiumPatch = bytecodePatch(
                 .classDef
         )
 
-        // 4) Application.onCreate — OkHttp interceptor factory + MMKV clear
+        // 4) Application.onCreate — install the OkHttp interceptor factory.
         //    Body rewrite is done only inside Java interceptor (no okio bytecode hacks).
         runCatching {
             MyoAdaptMainApplicationOnCreateFingerprint
