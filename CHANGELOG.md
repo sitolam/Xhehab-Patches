@@ -1,3 +1,9 @@
+## [3.3.1](https://github.com/sitolam/Xhehab-Patches/compare/v3.3.0...v3.3.1) (2026-08-06)
+
+### 🐛 Bug Fixes
+
+* MyoAdapt session loss and workout start ([410317f](https://github.com/sitolam/Xhehab-Patches/commit/410317f6e0ff01844acf795e75694ae2a9e8ec07))
+
 ## [3.3.0](https://github.com/Xhehab/Xhehab-Patches/compare/v3.2.0...v3.3.0) (2026-07-16)
 
 ### ✨ New Features
