@@ -1,3 +1,9 @@
+## [3.3.4](https://github.com/sitolam/Xhehab-Patches/compare/v3.3.3...v3.3.4) (2026-08-07)
+
+### 🐛 Bug Fixes
+
+* MyoAdapt remove session-start forge, keep clean unlock ([546e902](https://github.com/sitolam/Xhehab-Patches/commit/546e9020c18d716bb67f3e04f7e7583b0c3ef7d8))
+
 ## [3.3.3](https://github.com/sitolam/Xhehab-Patches/compare/v3.3.2...v3.3.3) (2026-08-06)
 
 ### 🐛 Bug Fixes
